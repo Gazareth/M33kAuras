@@ -497,6 +497,9 @@ local funcs = {
   end,
   SetOrientation = function (self, orientation)
     self.orientation = orientation
+    self.secretProgressBarMaskAnchor:SetOrientation(orientation)
+    self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection, true)
+
     if(self.orientation == "CLOCKWISE" or self.orientation == "ANTICLOCKWISE") then
       self.circular = true
       self.foreground:Hide()
@@ -623,6 +626,8 @@ local funcs = {
     self:ForAllLinears(self.foreground.SetTexRotation, self.effectiveTexRotation)
   end,
   UpdateTime = function(self)
+    self.secretProgress = nil
+    self.secretProgressBarMaskAnchor:Remove(self.foreground)
     local progress = 1
     if self.duration ~= 0 then
       local remaining = self.expirationTime - GetTime()
@@ -652,8 +657,25 @@ local funcs = {
   end,
   UpdateValue = function(self)
     if hasanysecretvalues(self.value, self.total) then
+      if self.circular then return end -- Blizzard native progress bar we piggy-back on for secret values doesn't support circular progress
+
+      self.secretProgress = "value"
+      self.secretProgressBarMaskAnchor:Apply(self.foreground)
+      self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection)
+      self:SetValueOnTexture(1)
+      self.secretProgressBarMaskAnchor:SetValues(self.value, 0, self.total, self.useSmoothProgress)
+      self:ReapplyAdditionalProgress()
+
+      if self.FrameTick then
+        self.FrameTick = nil
+        self.subRegionEvents:RemoveSubscriber("FrameTick", self)
+      end
       return
     end
+
+    self.secretProgress = nil
+    self.secretProgressBarMaskAnchor:Remove(self.foreground)
+
     local progress = 1
     if(self.total > 0) then
       progress = self.value / self.total;
@@ -760,6 +782,7 @@ local funcs = {
       return
     end
     self.inverseDirection = inverse
+    self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection)
     local progress = 1 - self.progress;
     progress = progress > 0.0001 and progress or 0.0001;
     self:SetValueOnTexture(progress)
@@ -792,6 +815,8 @@ local function create(parent)
 
   region.foregroundSpinner = Private.CircularProgressTextureBase.create(region, "ARTWORK", 1)
   region.backgroundSpinner = Private.CircularProgressTextureBase.create(region, "BACKGROUND", 1)
+
+  region.secretProgressBarMaskAnchor = Private.SecretProgressBarMaskAnchor.create(region)
 
   region.extraTextures = {};
   region.extraSpinners = {};
