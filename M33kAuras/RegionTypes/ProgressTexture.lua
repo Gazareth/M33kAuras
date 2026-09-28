@@ -480,7 +480,468 @@ local function FrameTick(self)
   end
 end
 
+local function CircularFrameTick(self)
+  -- Native anchors normalize the source, including numeric inversion. The
+  -- resulting fraction may be secret: only forward it to the native shader.
+  self.secretTexture:SetRadialProgressBarPercent(self.secretFillFrame:GetWidth())
+end
+
+local function StopFrameTick(self)
+  if self.FrameTick then
+    self.FrameTick = nil
+    self.subRegionEvents:RemoveSubscriber("FrameTick", self)
+  end
+end
+
+local function ResetSecretBar(bar)
+  -- SetValue detaches native timer updates, including when a pooled region is
+  -- reused for an ordinary progress source.
+  bar:SetMinMaxValues(0, 1)
+  bar:SetValue(0, Enum.StatusBarInterpolation.Immediate)
+  bar:Hide()
+end
+
+local whiteTexture = "Interface\\AddOns\\M33kAuras\\Media\\Textures\\Square_FullWhite"
+-- The client rounds native fill anchors in logical UI units. An integer width
+-- preserves empty/full endpoints; the readout frame converts it to a fraction.
+-- 65536 (2^16) is our precision scale, not an API requirement: one driver unit
+-- represents 1/65536 of the progress range. The readout uses the same scale.
+local circularDriverWidth = 65536
+
+local function SetSecretBarLinear(bar)
+  bar:SetRenderMode(Enum.StatusBarRenderMode.Linear)
+  local texture = bar:GetStatusBarTexture()
+  texture:ClearRadialProgressBar()
+  texture:SetSnapToPixelGrid(false)
+  texture:SetTexture(whiteTexture, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+  texture:SetRotation(0)
+  texture:SetTexCoord(0, 1, 0, 1)
+  texture:SetBlendMode("BLEND")
+  texture:SetDesaturated(false)
+  bar:SetStatusBarColor(1, 1, 1, 0)
+end
+
+local function AnchorSecretFill(bar, fill, horizontal, reverse, inverse)
+  local texture = bar:GetStatusBarTexture()
+  bar:SetOrientation(horizontal and "HORIZONTAL" or "VERTICAL")
+  bar:SetReverseFill(inverse and not reverse or (not inverse and reverse))
+  fill:ClearAllPoints()
+  if not inverse then
+    fill:SetAllPoints(texture)
+  elseif horizontal and not reverse then
+    fill:SetPoint("TOPLEFT", bar, "TOPLEFT")
+    fill:SetPoint("BOTTOMRIGHT", texture, "BOTTOMLEFT")
+  elseif horizontal then
+    fill:SetPoint("TOPLEFT", texture, "TOPRIGHT")
+    fill:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT")
+  elseif not reverse then
+    fill:SetPoint("TOPLEFT", texture, "BOTTOMLEFT")
+    fill:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT")
+  else
+    fill:SetPoint("TOPLEFT", bar, "TOPLEFT")
+    fill:SetPoint("BOTTOMRIGHT", texture, "TOPRIGHT")
+  end
+end
+
+local textureCorners = {
+  {"UL", UPPER_LEFT_VERTEX, 0, 0}, {"LL", LOWER_LEFT_VERTEX, 0, 1},
+  {"UR", UPPER_RIGHT_VERTEX, 1, 0}, {"LR", LOWER_RIGHT_VERTEX, 1, 1},
+}
+
+local centerRotationPoint = CreateVector2D(0.5, 0.5)
+local topLeftRotationPoint = CreateVector2D(0, 0)
+local bottomRightRotationPoint = CreateVector2D(1, 1)
+local linearMaskPadding = 0.01
+
+-- Warnings belong to an aura, while clones can use different progress sources.
+local circularCropWarnings = setmetatable({}, {__mode = "k"})
+local function UpdateCircularCropWarning(self, unsupported)
+  local uid = self.secretProgressUid
+  -- Collapse marks the region hidden before PreHide and condition resets.
+  -- Pooled clones stay referenced, so weak keys alone cannot release owners.
+  circularCropWarnings[self] = unsupported and self.toShow ~= false and uid or nil
+  local affected = false
+  for _, ownerUid in pairs(circularCropWarnings) do
+    if ownerUid == uid then
+      affected = true
+      break
+    end
+  end
+  Private.AuraWarnings.UpdateWarning(uid, "secretCircularCrop", affected and "warning" or nil,
+    affected and L["Secret circular progress requires equal Crop X and Crop Y. The foreground is hidden until they match."] or nil)
+end
+
 local funcs = {
+  PreShow = function(self)
+    if self.secretCircularUnsupported then
+      UpdateCircularCropWarning(self, true)
+    end
+    if self.secretProgress then
+      self.secretBar:SetToTargetValue()
+      if self.usesSlantExtension then self.secretAuxBar:SetToTargetValue() end
+      if self.circular then
+        self.secretTexture:SetRadialProgressBarPercent(self.secretFillFrame:GetWidth())
+      end
+    elseif self.useSmoothProgress then
+      self.smoothProgress:ResetSmoothedValue()
+    end
+  end,
+  PreHide = function(self)
+    if self.secretCircularUnsupported then
+      UpdateCircularCropWarning(self, false)
+    end
+  end,
+  UseNormalProgress = function(self)
+    if not self.secretBarMode then
+      return
+    end
+    StopFrameTick(self)
+    ResetSecretBar(self.secretBar)
+    ResetSecretBar(self.secretAuxBar)
+    self.secretTexture:ClearRadialProgressBar()
+    self.secretBarMode = nil
+    self.secretGeometryInverse = nil
+    self.secretGeometryDirty = nil
+    self.usesSlantExtension = nil
+    self.secretTexture:Hide()
+    self.secretMask:Hide()
+    self.secretRotationAngle = nil
+    self.secretRotationCircular = nil
+    if self.secretCircularUnsupported then
+      UpdateCircularCropWarning(self, false)
+      self.secretCircularUnsupported = nil
+    end
+    -- Native appearance updates leave hidden ordinary textures untouched.
+    -- Restore their current appearance once when returning to this renderer.
+    local r, g = self.color_anim_r or self.color_r, self.color_anim_g or self.color_g
+    local b, a = self.color_anim_b or self.color_b, self.color_anim_a or self.color_a
+    self.foreground:SetColor(r, g, b, a)
+    self.foregroundSpinner:SetColor(r, g, b, a)
+    self.foreground:SetDesaturated(self.desaturateForeground)
+    self.foregroundSpinner:SetDesaturated(self.desaturateForeground)
+    if self.circular then
+      self.foregroundSpinner:Show()
+    else
+      self.foreground:Show()
+    end
+  end,
+  UpdateSecretColor = function(self)
+    if self.secretProgress then
+      self.secretTexture:SetVertexColor(self.color_anim_r or self.color_r, self.color_anim_g or self.color_g,
+                                        self.color_anim_b or self.color_b, self.color_anim_a or self.color_a)
+    end
+  end,
+  UpdateSecretTexture = function(self)
+    if not self.secretProgress then
+      return
+    end
+    local texture = self.secretTexture
+    local wrap = self.circular and "CLAMPTOBLACKADDITIVE" or self.textureWrapMode
+    Private.SetTextureOrAtlas(texture, self.currentTexture, wrap, wrap)
+    texture:SetBlendMode(self.foreground:GetBlendMode())
+    texture:SetDesaturated(self.desaturateForeground)
+    self:UpdateSecretColor()
+    self:UpdateSecretTexCoords()
+    self:UpdateSecretRotation()
+  end,
+  UpdateSecretTexCoords = function(self)
+    if not self.secretProgress then
+      return
+    end
+    local texture, coord = self.secretTexture, self.secretTextureCoords
+    local unsupported = self.circular and self.crop_x ~= self.crop_y
+    if (self.secretCircularUnsupported or false) ~= unsupported then
+      self.secretCircularUnsupported = unsupported
+      UpdateCircularCropWarning(self, unsupported)
+    end
+    texture:SetShown(not unsupported and (self.circular or not self.hideLinearFill))
+    coord:SetFull()
+    if not self.circular and self.slanted and self.slantMode == "EXTEND" then
+      local slant = self.slant or 0
+      local horizontal = self.orientation == "HORIZONTAL" or self.orientation == "HORIZONTAL_INVERSE"
+      for _, corner in ipairs(textureCorners) do
+        local axis = corner[1] .. (horizontal and "x" or "y")
+        coord[axis] = coord[axis] * (1 + 2 * slant) - slant
+      end
+    end
+    local mirrorH = self.mirror_h or false
+    if self.mirror then mirrorH = not mirrorH end
+    local mirrorV = self.mirror_v or false
+    local rotation = self.effectiveTexRotation or self.texRotation
+    if self.circular then
+      -- The radial shader shares the artwork's UVs. Keep them canonical and
+      -- put the inverse artwork transform in public vertices instead. Equal
+      -- crop preserves angular progress; the static mask clips to the region.
+      local width, height = self.width * self.scalex, self.height * self.scaley
+      local cosine, sine = cos(rotation), sin(rotation)
+      local cropX = self.crop_x / 1.4142 * (mirrorH and -1 or 1)
+      local cropY = self.crop_y / 1.4142 * (mirrorV and -1 or 1)
+      for _, corner in ipairs(textureCorners) do
+        local name, u, v = corner[1], corner[3] - 0.5, corner[4] - 0.5
+        local x = (cosine * u + sine * v) * cropX
+        local y = (-sine * u + cosine * v) * cropY
+        coord[name .. "vx"] = (x - u) * width
+        coord[name .. "vy"] = -(y - v) * height
+      end
+      local reverse = self.orientation == "ANTICLOCKWISE"
+      local origin = reverse and self.endAngle or self.startAngle
+      local reflected = mirrorH ~= mirrorV
+      origin = rotation + (reflected and -origin or origin) + (mirrorV and 180 or 0)
+      texture:SetRadialProgressBarStartOffset(((origin + 180) % 360) / 360)
+      texture:SetRadialProgressBarEndOffset(1 - (self.endAngle - self.startAngle) / 360)
+      texture:SetRadialProgressBarReverse(reverse ~= reflected)
+      texture:SetRadialProgressBarFeather(0)
+    else
+      coord:Transform(self.crop_x, self.crop_y, rotation, mirrorH, mirrorV, self.user_x, self.user_y)
+    end
+    coord:Apply()
+  end,
+  UpdateSecretRotation = function(self, force)
+    local angle = self.auraRotation or 0
+    if not force and self.secretRotationAngle == angle and self.secretRotationCircular == self.circular then return end
+    self.secretRotationAngle = angle
+    self.secretRotationCircular = self.circular
+    local radians = math.rad(angle)
+    local rotationPoint = centerRotationPoint
+    if not self.circular and not self.compress then
+      -- The artwork rotates around the region center, but the mask's center
+      -- moves with secret progress. Rotate around its fixed corner instead and
+      -- translate both anchors by R(corner) - corner. Only public size/angle
+      -- enter this calculation; the moving fill edge stays natively anchored.
+      local horizontal = self.orientation == "HORIZONTAL" or self.orientation == "HORIZONTAL_INVERSE"
+      local reverse = self.orientation == "HORIZONTAL_INVERSE" or self.orientation == "VERTICAL_INVERSE"
+      local width, height = self.width * self.scalex, self.height * self.scaley
+      local shift = self.slanted and self.slantMode == "EXTEND" and -(self.slant or 0) or 0
+      local topLeft = horizontal and not reverse or not horizontal and reverse
+      local x, y
+      if topLeft then
+        x = -width / 2 + (horizontal and shift * width or 0) - linearMaskPadding
+        y = height / 2 - (not horizontal and shift * height or 0) + linearMaskPadding
+        rotationPoint = topLeftRotationPoint
+      else
+        x = width / 2 - (horizontal and shift * width or 0)
+        y = -height / 2 + (not horizontal and shift * height or 0)
+        rotationPoint = bottomRightRotationPoint
+      end
+      local dx, dy = 0, 0
+      if angle ~= 0 then
+        local cosine, sine = cos(angle), sin(angle)
+        dx, dy = cosine * x - sine * y - x, sine * x + cosine * y - y
+      end
+      self.secretMask:SetPoint("TOPLEFT", self.secretFillFrame, "TOPLEFT", dx - linearMaskPadding, dy + linearMaskPadding)
+      self.secretMask:SetPoint("BOTTOMRIGHT", self.secretFillFrame, "BOTTOMRIGHT", dx, dy)
+    end
+    self.secretTexture:SetRotation(radians)
+    self.secretMask:SetRotation(radians, rotationPoint)
+  end,
+  UpdateSecretGeometry = function(self)
+    local bar, mask, fill = self.secretBar, self.secretMask, self.secretFillFrame
+    -- Duration direction already includes both inversions. Numeric values need
+    -- complementary geometry to invert the amount without Lua arithmetic.
+    local inverse = self.secretProgress == "value" and self.inverseDirection
+    self.usesSlantExtension = false
+    if self.circular then
+      bar:ClearAllPoints()
+      bar:SetPoint("TOPLEFT", self, "TOPLEFT")
+      bar:SetSize(circularDriverWidth, 1)
+      fill:SetScale(circularDriverWidth)
+      AnchorSecretFill(bar, fill, true, false, inverse)
+      self.secretTextureFrame:ClearAllPoints()
+      self.secretTextureFrame:SetAllPoints(self)
+      self.secretTexture:ClearAllPoints()
+      self.secretTexture:SetAllPoints(self.secretTextureFrame)
+      mask:ClearAllPoints()
+      mask:SetAllPoints(self.secretTextureFrame)
+      for _, corner in ipairs(textureCorners) do
+        mask:SetVertexOffset(corner[2], 0, 0)
+      end
+      mask:SetTexCoord(0, 1, 0, 1)
+      return
+    end
+
+    fill:SetScale(1)
+    local horizontal = self.orientation == "HORIZONTAL" or self.orientation == "HORIZONTAL_INVERSE"
+    local reverse = self.orientation == "HORIZONTAL_INVERSE" or self.orientation == "VERTICAL_INVERSE"
+    local width, height = self.width * self.scalex, self.height * self.scaley
+    local slant = self.slanted and (self.slant or 0) or 0
+    local extend = self.slantMode == "EXTEND"
+    self.hideLinearFill = slant == 1 and not extend
+    local factor = (not self.compress or extend) and (extend and 1 + slant or 1 - slant) or 1
+    local shift = not self.compress and extend and -slant or 0
+    local origin = horizontal and (reverse and "TOPRIGHT" or "TOPLEFT")
+                             or (reverse and "TOPLEFT" or "BOTTOMLEFT")
+    bar:ClearAllPoints()
+    bar:SetPoint(origin, self, origin, horizontal and shift * width * (reverse and -1 or 1) or 0,
+                                     not horizontal and shift * height * (reverse and -1 or 1) or 0)
+    bar:SetSize(horizontal and width * factor or width, horizontal and height or height * factor)
+    AnchorSecretFill(bar, fill, horizontal, reverse, inverse)
+    self.secretTextureFrame:ClearAllPoints()
+    self.secretTexture:ClearAllPoints()
+    self.secretTexture:SetAllPoints(self.secretTextureFrame)
+    self.secretTextureFrame:SetAllPoints(self)
+    if not self.compress and extend and slant > 0 then
+      -- EXTEND slants can draw outside the region. Expand the artwork as well
+      -- as the mask; an enlarged mask cannot reveal pixels outside its texture.
+      self.secretTexture:ClearAllPoints()
+      self.secretTexture:SetPoint("TOPLEFT", self.secretTextureFrame, "TOPLEFT", horizontal and -slant * width or 0,
+                                  horizontal and 0 or slant * height)
+      self.secretTexture:SetPoint("BOTTOMRIGHT", self.secretTextureFrame, "BOTTOMRIGHT", horizontal and slant * width or 0,
+                                  horizontal and 0 or -slant * height)
+    end
+    mask:ClearAllPoints()
+    for _, corner in ipairs(textureCorners) do
+      mask:SetVertexOffset(corner[2], 0, 0)
+    end
+    mask:SetTexCoord(0, 1, 0, 1)
+    self.usesSlantExtension = self.compress and extend and slant > 0
+
+    local shape = self.secretShape
+    shape.width, shape.height = width, height
+    shape.slant, shape.slantFirst, shape.slantMode = slant, self.slantFirst, self.slantMode
+    shape.coord:SetFull()
+    self.foreground.ApplyProgressToCoord(shape, 0, 1)
+    local coord = shape.coord
+    if self.compress then
+      self.secretTextureFrame:ClearAllPoints()
+      if self.usesSlantExtension then
+        local extension, extensionFill = self.secretAuxBar, self.secretAuxFillFrame
+        extension:ClearAllPoints()
+        local point = horizontal and (reverse and "TOPLEFT" or "TOPRIGHT")
+                                or (reverse and "BOTTOMLEFT" or "TOPLEFT")
+        extension:SetPoint(point, self, origin)
+        extension:SetSize(horizontal and width * slant or width, horizontal and height or height * slant)
+        AnchorSecretFill(extension, extensionFill, horizontal, not reverse, inverse)
+        local first = (horizontal and not reverse) or (not horizontal and reverse)
+        self.secretTextureFrame:SetPoint("TOPLEFT", first and extensionFill or fill, "TOPLEFT")
+        self.secretTextureFrame:SetPoint("BOTTOMRIGHT", first and fill or extensionFill, "BOTTOMRIGHT")
+      else
+        self.secretTextureFrame:SetAllPoints(fill)
+      end
+      mask:SetAllPoints(self.secretTextureFrame)
+      -- A public shear in mask coordinates scales with the native rectangle.
+      -- Unlike pixel vertex offsets, this also preserves slant under compression.
+      local span = horizontal and coord.URx - coord.ULx or coord.LLy - coord.ULy
+      if span == 0 then
+        mask:SetTexCoord(-1, -1, -1, -1)
+      else
+        local coords = {}
+        for _, corner in ipairs(textureCorners) do
+          local u, v = corner[3], corner[4]
+          if horizontal then
+            local x = extend and u * (1 + 2 * slant) - slant or u
+            u = (x - coord.ULx - (coord.LLx - coord.ULx) * v) / span
+          else
+            local y = extend and v * (1 + 2 * slant) - slant or v
+            v = (y - coord.ULy - (coord.URy - coord.ULy) * u) / span
+          end
+          coords[#coords + 1], coords[#coords + 2] = u, v
+        end
+        mask:SetTexCoord(unpack(coords))
+      end
+    else
+      local left = horizontal and (reverse and 1 - shift - factor or shift) or 0
+      local top = not horizontal and (reverse and shift or 1 - shift - factor) or 0
+      for _, corner in ipairs(textureCorners) do
+        local name, vertex, x, y = unpack(corner)
+        mask:SetVertexOffset(vertex, (coord[name .. "x"] - left - x * (horizontal and factor or 1)) * width,
+                                     -(coord[name .. "y"] - top - y * (horizontal and 1 or factor)) * height)
+      end
+    end
+  end,
+  UpdateSecretBar = function(self)
+    local mode = self.circular and "circular" or "linear"
+    local inverse = self.secretProgress == "value" and self.inverseDirection or false
+    local changedMode = self.secretBarMode ~= mode
+    if not changedMode and self.secretGeometryInverse == inverse and not self.secretGeometryDirty then
+      return false
+    end
+    local snapProgress = changedMode and self.secretBarMode ~= nil
+    if changedMode then
+      if not self.secretBarMode then
+        -- First native entry: stop ordinary smoothing and hide its foregrounds.
+        self.smoothProgress:ResetSmoothedValue()
+        StopFrameTick(self)
+        self.foreground:Hide()
+        self.foregroundSpinner:Hide()
+        self.additionalProgress = nil
+        self.additionalProgressMin, self.additionalProgressMax = nil, nil
+        hideExtraTextures(self.extraTextures, 1)
+        hideExtraTextures(self.extraSpinners, 1)
+      end
+      -- The auxiliary only drives compressed slants. Discard its previous
+      -- timer and interpolation before switching renderer roles.
+      ResetSecretBar(self.secretBar)
+      ResetSecretBar(self.secretAuxBar)
+      self.secretBarMode = mode
+    end
+    self.secretGeometryInverse = inverse
+    self.secretGeometryDirty = nil
+    local wasExtension = self.usesSlantExtension
+    if not self.circular then
+      self.secretTexture:ClearRadialProgressBar()
+    end
+    self:UpdateSecretGeometry()
+    self.secretMask:Show()
+    if changedMode then
+      self:UpdateSecretTexture()
+    else
+      self:UpdateSecretTexCoords()
+      -- Size, direction, and compression can change the mask's fixed corner
+      -- without changing the angle.
+      self:UpdateSecretRotation(true)
+    end
+    self.secretBar:Show()
+    if self.usesSlantExtension then
+      self.secretAuxBar:Show()
+    elseif wasExtension and not changedMode then
+      ResetSecretBar(self.secretAuxBar)
+    end
+    if changedMode then
+      if self.circular then
+        -- RegionPrototype activates this subscription only while toShow is true,
+        -- using the same lifecycle as ordinary timed progress.
+        self.FrameTick = CircularFrameTick
+        self.subRegionEvents:AddSubscriber("FrameTick", self)
+      else
+        StopFrameTick(self)
+      end
+    end
+    return snapProgress or (self.usesSlantExtension and not wasExtension)
+  end,
+  SetProgressSecret = function(self)
+    local snapProgress = self:UpdateSecretBar()
+    local bar, auxiliary = self.secretBar, self.usesSlantExtension and self.secretAuxBar
+    if self.secretProgress == "duration" then
+      local inverse = not self.inverse ~= not self.inverseDirection
+      local direction = inverse and Enum.StatusBarTimerDirection.ElapsedTime or Enum.StatusBarTimerDirection.RemainingTime
+      bar:SetTimerDuration(self.durationObject, Enum.StatusBarInterpolation.Immediate, direction)
+      if auxiliary then
+        auxiliary:SetTimerDuration(self.durationObject, Enum.StatusBarInterpolation.Immediate, direction)
+      end
+    else
+      local interpolation = self.useSmoothProgress and Enum.StatusBarInterpolation.ExponentialEaseOut
+                                                    or Enum.StatusBarInterpolation.Immediate
+      bar:SetMinMaxValues(self.minProgress, self.maxProgress)
+      bar:SetValue(self.value, interpolation)
+      if auxiliary then
+        auxiliary:SetMinMaxValues(self.minProgress, self.maxProgress)
+        auxiliary:SetValue(self.value, interpolation)
+      end
+    end
+    if snapProgress then
+      -- Start newly assigned drivers at their targets before interpolating later
+      -- updates. EXTEND's two edges must also start with a shared value.
+      bar:SetToTargetValue()
+      if auxiliary then auxiliary:SetToTargetValue() end
+    end
+    if self.circular then
+      self.secretTexture:SetRadialProgressBarPercent(self.secretFillFrame:GetWidth())
+    end
+  end,
+  UpdateDuration = function(self)
+    self.secretProgress = "duration"
+    self:SetProgressSecret()
+  end,
   ForAllSpinners = function(self, f, ...)
     f(self.foregroundSpinner, ...)
     f(self.backgroundSpinner, ...)
@@ -497,9 +958,6 @@ local funcs = {
   end,
   SetOrientation = function (self, orientation)
     self.orientation = orientation
-    self.secretProgressBarMaskAnchor:SetOrientation(orientation)
-    self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection, true)
-
     if(self.orientation == "CLOCKWISE" or self.orientation == "ANTICLOCKWISE") then
       self.circular = true
       self.foreground:Hide()
@@ -536,8 +994,15 @@ local funcs = {
                                     self.slantFirst, self.slantMode)
       end
     end
-    self:SetValueOnTexture(self.progress)
-    self:ReapplyAdditionalProgress()
+    if self.secretProgress then
+      self.foreground:Hide()
+      self.foregroundSpinner:Hide()
+      self.secretGeometryDirty = true
+      self:SetProgressSecret()
+    else
+      self:SetValueOnTexture(self.progress)
+      self:ReapplyAdditionalProgress()
+    end
   end,
   SetAnimRotation = function(self, angle)
     self.texAnimationRotation = angle
@@ -558,21 +1023,29 @@ local funcs = {
       a = a or 1
     end
     self.color_a = a
-    self.foreground:SetColor(self.color_anim_r or r, self.color_anim_g or g,
-                                   self.color_anim_b or b, self.color_anim_a or a)
-    self.foregroundSpinner:SetColor(self.color_anim_r or r, self.color_anim_g or g,
-                                    self.color_anim_b or b, self.color_anim_a or a)
+    r, g, b, a = self.color_anim_r or r, self.color_anim_g or g, self.color_anim_b or b, self.color_anim_a or a
+    if self.secretProgress then
+      self.secretTexture:SetVertexColor(r, g, b, a)
+    else
+      self.foreground:SetColor(r, g, b, a)
+      self.foregroundSpinner:SetColor(r, g, b, a)
+    end
   end,
   ColorAnim = function(self, r, g, b, a)
     self.color_anim_r = r
     self.color_anim_g = g
     self.color_anim_b = b
-    self.color_anim_a = a
     if (r or g or b) then
       a = a or 1;
     end
-    self.foreground:SetColor(r or self.color_r, g or self.color_g, b or self.color_b, a or self.color_a)
-    self.foregroundSpinner:SetColor(r or self.color_r, g or self.color_g, b or self.color_b, a or self.color_a)
+    self.color_anim_a = a
+    r, g, b, a = r or self.color_r, g or self.color_g, b or self.color_b, a or self.color_a
+    if self.secretProgress then
+      self.secretTexture:SetVertexColor(r, g, b, a)
+    else
+      self.foreground:SetColor(r, g, b, a)
+      self.foregroundSpinner:SetColor(r, g, b, a)
+    end
   end,
   GetColor = function(self)
     return self.color_r, self.color_g, self.color_b, self.color_a
@@ -587,6 +1060,9 @@ local funcs = {
     for _, extraTexture in ipairs(self.extraTextures) do
       extraTexture:SetAuraRotation(auraRotationRadians)
     end
+    if self.secretProgress then
+      self:UpdateSecretRotation()
+    end
   end,
   DoPosition = function(self)
     self:SetWidth(self.width * self.scalex);
@@ -597,11 +1073,21 @@ local funcs = {
     else
       self:ForAllLinears(self.foreground.Update)
     end
+    if self.secretProgress then
+      if self.circular then
+        -- Circular anchors follow the region and the source width is fixed.
+        self:UpdateSecretTexCoords()
+      else
+        self.secretGeometryDirty = true
+        self:UpdateSecretBar()
+      end
+    end
   end,
   SetMirror = function(self, mirror)
     self.mirror = mirror
     self:ForAllSpinners(self.foregroundSpinner.SetMirror, mirror)
     self:ForAllLinears(self.foreground.SetMirror, mirror)
+    self:UpdateSecretTexCoords()
   end,
   UpdateTextures = function(self)
     if self.circular then
@@ -609,25 +1095,29 @@ local funcs = {
     else
       self:ForAllLinears(self.foreground.UpdateTextures)
     end
+    self:UpdateSecretTexCoords()
   end,
   SetCropX = function(self, x)
     self.crop_x = 1 + x
     self:ForAllSpinners(self.foregroundSpinner.SetCropX, self.crop_x)
     self:ForAllLinears(self.foreground.SetCropX, self.crop_x)
+    self:UpdateSecretTexCoords()
   end,
   SetCropY = function(self, y)
     self.crop_y = 1 + y
     self:ForAllSpinners(self.foregroundSpinner.SetCropY, self.crop_y)
-    self:ForAllLinears(self.foreground.SetCropX, self.crop_x)
+    self:ForAllLinears(self.foreground.SetCropY, self.crop_y)
+    self:UpdateSecretTexCoords()
   end,
   UpdateEffectiveRotation = function(self)
     self.effectiveTexRotation = self.texAnimationRotation or self.texRotation
     self:ForAllSpinners(self.foregroundSpinner.SetTexRotation, self.effectiveTexRotation)
     self:ForAllLinears(self.foreground.SetTexRotation, self.effectiveTexRotation)
+    self:UpdateSecretTexCoords()
   end,
   UpdateTime = function(self)
     self.secretProgress = nil
-    self.secretProgressBarMaskAnchor:Remove(self.foreground)
+    if self.secretBarMode then self:UseNormalProgress() end
     local progress = 1
     if self.duration ~= 0 then
       local remaining = self.expirationTime - GetTime()
@@ -657,24 +1147,13 @@ local funcs = {
   end,
   UpdateValue = function(self)
     if hasanysecretvalues(self.value, self.total) then
-      if self.circular then return end -- Blizzard native progress bar we piggy-back on for secret values doesn't support circular progress
-
       self.secretProgress = "value"
-      self.secretProgressBarMaskAnchor:Apply(self.foreground)
-      self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection)
-      self:SetValueOnTexture(1)
-      self.secretProgressBarMaskAnchor:SetValues(self.value, 0, self.total, self.useSmoothProgress)
-      self:ReapplyAdditionalProgress()
-
-      if self.FrameTick then
-        self.FrameTick = nil
-        self.subRegionEvents:RemoveSubscriber("FrameTick", self)
-      end
+      self:SetProgressSecret()
       return
     end
 
     self.secretProgress = nil
-    self.secretProgressBarMaskAnchor:Remove(self.foreground)
+    if self.secretBarMode then self:UseNormalProgress() end
 
     local progress = 1
     if(self.total > 0) then
@@ -698,7 +1177,7 @@ local funcs = {
   end,
   SetAdditionalProgress = function(self, additionalProgress, currentMin, currentMax, inverse)
     -- Texture overlays require arithmetic; only status bars can render secret progress.
-    if hasanysecretvalues(self.progress, currentMin, currentMax)
+    if self.secretProgress or hasanysecretvalues(self.progress, currentMin, currentMax)
       or (self.progressType == "static" and hasanysecretvalues(self.value, self.total))
     then
       additionalProgress, currentMin, currentMax = nil, nil, nil;
@@ -706,6 +1185,10 @@ local funcs = {
     self:ApplyAdditionalProgress(additionalProgress, currentMin, currentMax, inverse)
   end,
   ReapplyAdditionalProgress = function(self)
+    if self.secretProgress then
+      self:SetAdditionalProgress(nil)
+      return
+    end
     self:ApplyAdditionalProgress(self.additionalProgress, self.additionalProgressMin,
                                  self.additionalProgressMax, self.additionalProgressInverse)
   end,
@@ -733,10 +1216,16 @@ local funcs = {
     for _, extraSpinner in ipairs(self.extraSpinners) do
       extraSpinner:SetTextureOrAtlas(texture);
     end
+    self:UpdateSecretTexture()
   end,
   SetForegroundDesaturated = function(self, b)
-    self.foreground:SetDesaturated(b)
-    self.foregroundSpinner:SetDesaturated(b)
+    self.desaturateForeground = b
+    if self.secretProgress then
+      self.secretTexture:SetDesaturated(b)
+    else
+      self.foreground:SetDesaturated(b)
+      self.foregroundSpinner:SetDesaturated(b)
+    end
   end,
   SetBackgroundDesaturated = function(self, b)
     self.background:SetDesaturated(b)
@@ -755,7 +1244,7 @@ local funcs = {
   SetRegionHeight = function(self, height)
     self.height = height
     self:ForAllSpinners(self.foregroundSpinner.SetHeight, height)
-    self:ForAllSpinners(self.foreground.SetHeight, height)
+    self:ForAllLinears(self.foreground.SetHeight, height)
     self:Scale(self.scalex, self.scaley)
   end,
   Scale = function(self, scalex, scaley)
@@ -782,7 +1271,11 @@ local funcs = {
       return
     end
     self.inverseDirection = inverse
-    self.secretProgressBarMaskAnchor:UpdateInverse(self.orientation, self.inverseDirection)
+    if self.secretProgress then
+      self.secretGeometryDirty = true
+      self:SetProgressSecret()
+      return
+    end
     local progress = 1 - self.progress;
     progress = progress > 0.0001 and progress or 0.0001;
     self:SetValueOnTexture(progress)
@@ -816,7 +1309,49 @@ local function create(parent)
   region.foregroundSpinner = Private.CircularProgressTextureBase.create(region, "ARTWORK", 1)
   region.backgroundSpinner = Private.CircularProgressTextureBase.create(region, "BACKGROUND", 1)
 
-  region.secretProgressBarMaskAnchor = Private.SecretProgressBarMaskAnchor.create(region)
+  local secretBar = CreateFrame("StatusBar", nil, region)
+  secretBar:SetStatusBarTexture(whiteTexture)
+  local barTexture = secretBar:GetStatusBarTexture()
+  barTexture:SetDrawLayer("ARTWORK", 0)
+  barTexture:SetTexelSnappingBias(0)
+  SetSecretBarLinear(secretBar)
+  secretBar:Hide()
+  region.secretBar = secretBar
+  region.secretFillFrame = CreateFrame("Frame", nil, region)
+  -- A second linear driver supplies the opposite edge of compressed EXTEND.
+  local auxiliary = CreateFrame("StatusBar", nil, region)
+  auxiliary:SetStatusBarTexture(whiteTexture)
+  SetSecretBarLinear(auxiliary)
+  auxiliary:Hide()
+  region.secretAuxBar = auxiliary
+  region.secretAuxFillFrame = CreateFrame("Frame", nil, region)
+
+  local secretTextureFrame = CreateFrame("Frame", nil, region)
+  secretTextureFrame:SetAllPoints(region)
+  local secretTexture = secretTextureFrame:CreateTexture(nil, "ARTWORK", nil, 0)
+  secretTexture:SetAllPoints(secretTextureFrame)
+  secretTexture:SetSnapToPixelGrid(false)
+  secretTexture:SetTexelSnappingBias(0)
+  secretTexture:Hide()
+  region.secretTextureFrame = secretTextureFrame
+  region.secretTexture = secretTexture
+  region.secretTextureCoords = Private.TextureCoords.create(secretTexture)
+  local mask = secretTextureFrame:CreateMaskTexture()
+  mask:SetTexture(whiteTexture, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE", "NEAREST")
+  mask:SetSnapToPixelGrid(false)
+  mask:SetTexelSnappingBias(0)
+  secretTexture:AddMaskTexture(mask)
+  mask:Hide()
+  region.secretMask = mask
+  region.secretShape = {coord = Private.TextureCoords.create(mask)}
+  -- Subregion frames start one level above the region. Native foregrounds must
+  -- remain beneath them when groups change the region's frame level.
+  local function UpdateSecretFrameLevel()
+    secretTextureFrame:SetFrameLevel(region:GetFrameLevel())
+    secretBar:SetFrameLevel(region:GetFrameLevel())
+  end
+  hooksecurefunc(region, "SetFrameLevel", UpdateSecretFrameLevel)
+  UpdateSecretFrameLevel()
 
   region.extraTextures = {};
   region.extraSpinners = {};
@@ -849,6 +1384,11 @@ end
 
 
 local function modify(parent, region, data)
+  region.secretProgress = nil
+  region:UseNormalProgress()
+  region.secretProgressUid = data.uid
+  region.smoothProgress:ResetSmoothedValue()
+  StopFrameTick(region)
   Private.regionPrototype.modify(parent, region, data);
 
   local background, foreground = region.background, region.foreground;
@@ -896,14 +1436,8 @@ local function modify(parent, region, data)
   region.slantMode = data.slantMode;
   region.auraRotation = data.auraRotation
   region.texRotation = data.rotation
-
-  if region.useSmoothProgress then
-    region.PreShow = function()
-      region.smoothProgress:ResetSmoothedValue();
-    end
-  else
-    region.PreShow = nil
-  end
+  region.effectiveTexRotation = data.rotation
+  region.desaturateForeground = data.desaturateForeground
 
   region.FrameTick = nil
 

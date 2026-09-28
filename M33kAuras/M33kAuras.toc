@@ -75,7 +75,6 @@ DurationObject.lua
 RegionTypes\SmoothStatusBarMixin.lua
 RegionTypes\RegionPrototype.lua
 RegionTypes\Empty.lua
-BaseRegions\SecretProgressBarMaskAnchor.lua
 BaseRegions\TextureCoords.lua
 BaseRegions\CircularProgressTexture.lua
 BaseRegions\LinearProgressTexture.lua
