@@ -33,6 +33,7 @@ local tests = {
   "health_test.lua",
   "instance_test.lua",
   "pvp_flag_test.lua",
+  "progress_texture_test.lua",
   "raid_role_test.lua",
   "ruleset_load_test.lua",
   "spell_cache_test.lua",

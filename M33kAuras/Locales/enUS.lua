@@ -2,6 +2,7 @@ local L = M33kAuras.L
 
 -- M33kAuras
 L["If you require additional assistance, please open a ticket on GitHub."] = "If you require additional assistance, please open a ticket on GitHub."
+L["Secret circular progress requires equal Crop X and Crop Y. The foreground is hidden until they match."] = "Secret circular progress requires equal Crop X and Crop Y. The foreground is hidden until they match."
 L["M33kAuras has detected empty settings. If this is unexpected, please report it on GitHub."] = "M33kAuras has detected empty settings. If this is unexpected, please report it on GitHub."
 L["This filter has been moved to the Location trigger. Change your aura to use the new Location trigger."] = "This filter has been moved to the Location trigger. Change your aura to use the new Location trigger."
 L["A detailed overview of your auras and M33kAuras systems."] = "A detailed overview of your auras and M33kAuras systems."
